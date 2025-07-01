@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Data Table Viewer</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { margin: 0; font-family: system-ui, sans-serif; }
+        .animate-spin { animation: spin 1s linear infinite; }
+        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useMemo } = React;
+
+        const DataViewer = () => {
+            const [inputData, setInputData] = useState('');
+            const [parsedData, setParsedData] = useState(null);
+            const [error, setError] = useState('');
+            const [dataType, setDataType] = useState('');
+            const [isCorreting, setIsCorreting] = useState(false);
+            const [apiKey, setApiKey] = useState('');
+            const [showApiKey, setShowApiKey] = useState(false);
+
+            const correctDataWithGemini = async (data) => {
+                if (!apiKey.trim()) {
+                    throw new Error('Please enter your Gemini API key first');
+                }
+
+                const prompt = `You are a data format expert. Fix this malformed data to make it valid JSON or CSV format. 
+
+Rules:
+1. If it looks like JSON, return valid JSON
+2. If it looks like CSV/tabular, return proper CSV format
+3. Add missing quotes, brackets, commas as needed
+4. Fix common syntax errors
+5. Preserve the original data structure and values
+6. Return ONLY the corrected data, no explanations
+
+Data to fix:
+${data}`;
+
+                try {
+                    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                            contents: [{
+                                parts: [{ text: prompt }]
+                            }],
+                            generationConfig: {
+                                temperature: 0.1,
+                                topK: 1,
+                                topP: 0.8,
+                                maxOutputTokens: 2048,
+                            },
+                            safetySettings: [
+                                {
+                                    category: "HARM_CATEGORY_HARASSMENT",
+                                    threshold: "BLOCK_MEDIUM_AND_ABOVE"
+                                },
+                                {
+                                    category: "HARM_CATEGORY_HATE_SPEECH", 
+                                    threshold: "BLOCK_MEDIUM_AND_ABOVE"
+                                },
+                                {
+                                    category: "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                                    threshold: "BLOCK_MEDIUM_AND_ABOVE"
+                                },
+                                {
+                                    category: "HARM_CATEGORY_DANGEROUS_CONTENT",
+                                    threshold: "BLOCK_MEDIUM_AND_ABOVE"
+                                }
+                            ]
+                        })
+                    });
+
+                    if (!response.ok) {
+                        const errorData = await response.json().catch(() => ({}));
+                        throw new Error(errorData.error?.message || `API Error: ${response.status}`);
+                    }
+
+                    const result = await response.json();
+                    
+                    if (!result.candidates || result.candidates.length === 0) {
+                        throw new Error('No response from Gemini API');
+                    }
+
+                    const correctedData = result.candidates[0].content.parts[0].text.trim();
+                    
+                    // Clean up markdown formatting if present
+                    return correctedData
+                        .replace(/^```[\w]*\n?/, '')
+                        .replace(/\n?```$/, '')
+                        .trim();
+
+                } catch (error) {
+                    console.error('Gemini API Error:', error);
+                    throw new Error(`AI correction failed: ${error.message}`);
+                }
+            };
+
+            const parseData = (data) => {
+                if (!data.trim()) return null;
+
+                // Try JSON first
+                try {
+                    const jsonData = JSON.parse(data);
+                    const arrayData = Array.isArray(jsonData) ? jsonData : [jsonData];
+                    return { data: arrayData, type: 'JSON' };
+                } catch (e) {}
+
+                // Try delimited formats
+                const lines = data.trim().split('\n').filter(line => line.trim());
+                if (lines.length > 1) {
+                    // Detect delimiter by counting occurrences
+                    const delimiters = [',', '\t', '|', ';'];
+                    let bestDelimiter = ',';
+                    let maxCount = 0;
+                    
+                    delimiters.forEach(delimiter => {
+                        const count = (lines[0].match(new RegExp(`\\${delimiter}`, 'g')) || []).length;
+                        if (count > maxCount) {
+                            maxCount = count;
+                            bestDelimiter = delimiter;
+                        }
+                    });
+                    
+                    if (maxCount > 0) {
+                        const headers = lines[0].split(bestDelimiter).map(h => h.trim().replace(/^["']|["']$/g, ''));
+                        const rows = lines.slice(1).map(line => {
+                            const values = line.split(bestDelimiter).map(v => v.trim().replace(/^["']|["']$/g, ''));
+                            const obj = {};
+                            headers.forEach((header, index) => {
+                                obj[header] = values[index] || '';
+                            });
+                            return obj;
+                        });
+                        
+                        if (rows.length > 0 && headers.length > 1) {
+                            const typeMap = { ',': 'CSV', '\t': 'TSV', '|': 'Pipe-separated', ';': 'Semicolon-separated' };
+                            return { data: rows, type: typeMap[bestDelimiter] };
+                        }
+                    }
+                }
+
+                throw new Error('Unrecognized format. Please use JSON, CSV, or other delimited data.');
+            };
+
+            const handleDataChange = (value) => {
+                setInputData(value);
+                setError('');
+                
+                if (!value.trim()) {
+                    setParsedData(null);
+                    setDataType('');
+                    return;
+                }
+
+                try {
+                    const result = parseData(value);
+                    setParsedData(result.data);
+                    setDataType(result.type);
+                } catch (err) {
+                    setError(err.message);
+                    setParsedData(null);
+                    setDataType('');
+                }
+            };
+
+            const handleAICorrection = async () => {
+                if (!inputData.trim()) return;
+                
+                setIsCorreting(true);
+                try {
+                    const corrected = await correctDataWithGemini(inputData);
+                    setInputData(corrected);
+                    
+                    // Try to parse the corrected data
+                    const result = parseData(corrected);
+                    setParsedData(result.data);
+                    setDataType(result.type);
+                    setError('');
+                } catch (err) {
+                    setError(err.message);
+                } finally {
+                    setIsCorreting(false);
+                }
+            };
+
+            const columns = useMemo(() => {
+                if (!parsedData?.length) return [];
+                const allKeys = new Set();
+                parsedData.forEach(item => Object.keys(item).forEach(key => allKeys.add(key)));
+                return Array.from(allKeys);
+            }, [parsedData]);
+
+            const exportCSV = () => {
+                if (!parsedData?.length) return;
+                const csv = [
+                    columns.join(','),
+                    ...parsedData.map(row => 
+                        columns.map(col => {
+                            const value = (row[col] || '').toString().replace(/"/g, '""');
+                            return `"${value}"`;
+                        }).join(',')
+                    )
+                ].join('\n');
+                
+                const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = `data_export_${new Date().toISOString().split('T')[0]}.csv`;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                URL.revokeObjectURL(url);
+            };
+
+            return (
+                <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-slate-900 p-6">
+                    <div className="max-w-7xl mx-auto">
+                        {/* Header */}
+                        <div className="text-center mb-8">
+                            <h1 className="text-4xl font-bold text-white mb-2">🤖 AI Data Table Viewer</h1>
+                            <p className="text-gray-300 text-lg">
+                                Smart data parsing powered by Google Gemini AI
+                            </p>
+                        </div>
+
+                        {/* API Key Section */}
+                        <div className="bg-white/10 backdrop-blur-lg rounded-2xl p-6 mb-6 border border-white/20">
+                            <h2 className="text-xl font-semibold text-white mb-4">🔑 Gemini API Configuration</h2>
+                            <div className="flex gap-4 items-end">
+                                <div className="flex-1">
+                                    <label className="block text-sm font-medium text-gray-300 mb-2">
+                                        Gemini API Key
+                                    </label>
+                                    <input
+                                        type={showApiKey ? "text" : "password"}
+                                        value={apiKey}
+                                        onChange={(e) => setApiKey(e.target.value)}
+                                        placeholder="Enter your Gemini API key (starts with AIza...)"
+                                        className="w-full bg-black/20 border border-white/20 rounded-xl p-3 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                    />
+                                </div>
+                                <button
+                                    onClick={() => setShowApiKey(!showApiKey)}
+                                    className="bg-gray-600 hover:bg-gray-700 text-white px-4 py-3 rounded-xl transition-colors"
+                                    title={showApiKey ? "Hide API Key" : "Show API Key"}
+                                >
+                                    {showApiKey ? "🙈" : "👁️"}
+                                </button>
+                            </div>
+                            <p className="text-xs text-gray-400 mt-2">
+                                Get your free API key from <a href="https://makersuite.google.com/app/apikey" target="_blank" className="text-blue-400 hover:text-blue-300">Google AI Studio</a>
+                            </p>
+                            <div className="mt-3">
+                                <span className={`px-3 py-1 rounded-full text-xs ${
+                                    apiKey.trim() 
+                                        ? 'bg-green-500/20 text-green-300' 
+                                        : 'bg-yellow-500/20 text-yellow-300'
+                                }`}>
+                                    {apiKey.trim() ? '✅ API Key provided' : '⚠️ Enter API key to enable AI features'}
+                                </span>
+                            </div>
+                        </div>
+
+                        {/* Input Section */}
+                        <div className="bg-white/10 backdrop-blur-lg rounded-2xl p-6 mb-6 border border-white/20">
+                            <div className="flex items-center justify-between mb-4">
+                                <h2 className="text-xl font-semibold text-white">📝 Input Data</h2>
+                                {dataType && (
+                                    <span className="bg-green-500/20 text-green-300 px-3 py-1 rounded-full text-sm">
+                                        ✅ {dataType} detected
+                                    </span>
+                                )}
+                            </div>
+                            
+                            <textarea
+                                value={inputData}
+                                onChange={(e) => handleDataChange(e.target.value)}
+                                placeholder="Examples:&#10;&#10;JSON: [{&quot;name&quot;: &quot;John&quot;, &quot;age&quot;: 30}, {&quot;name&quot;: &quot;Jane&quot;, &quot;age&quot;: 25}]&#10;&#10;CSV:&#10;name,age,city&#10;John,30,New York&#10;Jane,25,Los Angeles&#10;&#10;Try broken data to test AI correction!"
+                                className="w-full h-40 bg-black/20 border border-white/20 rounded-xl p-4 text-white placeholder-gray-400 resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono text-sm"
+                            />
+                            
+                            {error && (
+                                <div className="mt-4 bg-red-500/20 border border-red-500/30 rounded-xl p-4">
+                                    <div className="flex items-start gap-3">
+                                        <span className="text-red-400 text-xl">⚠️</span>
+                                        <div className="flex-1">
+                                            <h3 className="text-red-300 font-medium">Parse Error</h3>
+                                            <p className="text-red-200 text-sm mt-1">{error}</p>
+                                            
+                                            {inputData.trim() && (
+                                                <div className="mt-4">
+                                                    <p className="text-blue-200 text-sm mb-3">
+                                                        🪄 Let Gemini AI fix the formatting issues:
+                                                    </p>
+                                                    <button
+                                                        onClick={handleAICorrection}
+                                                        disabled={isCorreting || !apiKey.trim()}
+                                                        className="bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-6 py-2 rounded-lg flex items-center gap-2 text-sm transition-all transform hover:scale-105"
+                                                    >
+                                                        {isCorreting ? (
+                                                            <>
+                                                                <span className="animate-spin">⟳</span>
+                                                                AI is fixing your data...
+                                                            </>
+                                                        ) : (
+                                                            <>
+                                                                ✨ Fix with Gemini AI
+                                                            </>
+                                                        )}
+                                                    </button>
+                                                    
+                                                    {!apiKey.trim() && (
+                                                        <p className="text-xs text-yellow-300 mt-2">
+                                                            ↑ Enter your Gemini API key first to use AI correction
+                                                        </p>
+                                                    )}
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Data Table */}
+                        {parsedData?.length > 0 && (
+                            <div className="bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 overflow-hidden">
+                                <div className="p-6 border-b border-white/20 flex items-center justify-between">
+                                    <div>
+                                        <h2 className="text-xl font-semibold text-white">📊 Data Table</h2>
+                                        <p className="text-gray-300 text-sm mt-1">
+                                            {parsedData.length} rows • {columns.length} columns
+                                        </p>
+                                    </div>
+                                    <button
+                                        onClick={exportCSV}
+                                        className="bg-green-600 hover:bg-green-700 text-white px-6 py-2 rounded-lg flex items-center gap-2 transition-colors shadow-lg"
+                                    >
+                                        📥 Export CSV
+                                    </button>
+                                </div>
+                                
+                                <div className="overflow-auto max-h-96">
+                                    <table className="w-full">
+                                        <thead className="sticky top-0 bg-black/60 backdrop-blur-sm">
+                                            <tr>
+                                                {columns.map((column, i) => (
+                                                    <th key={i} className="px-6 py-4 text-left text-sm font-semibold text-blue-300 border-b border-white/10">
+                                                        {column}
+                                                    </th>
+                                                ))}
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {parsedData.map((row, i) => (
+                                                <tr key={i} className="hover:bg-white/5 transition-colors border-b border-white/5">
+                                                    {columns.map((column, j) => (
+                                                        <td key={j} className="px-6 py-4 text-sm text-gray-200">
+                                                            {(row[column] || '').toString()}
+                                                        </td>
+                                                    ))}
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Footer */}
+                        <div className="text-center mt-8 text-gray-400 text-sm">
+                            <p>Built with React, Tailwind CSS, and Gemini AI</p>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        ReactDOM.render(<DataViewer />, document.getElementById('root'));
+    </script>
+</body>
+</html>
